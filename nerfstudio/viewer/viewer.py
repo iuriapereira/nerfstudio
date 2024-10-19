@@ -92,6 +92,7 @@ class Viewer:
         self.log_filename = log_filename
         self.datapath = datapath.parent if datapath.is_file() else datapath
         self.include_time = self.pipeline.datamanager.includes_time
+        self.camera_handles: Optional[Dict[int, viser.CameraFrustumHandle]] = None
 
         if self.config.websocket_port is None:
             websocket_port = viewer_utils.get_free_port(default_port=self.config.websocket_port_default)
@@ -170,29 +171,13 @@ class Viewer:
             label="Pause Training", disabled=False, icon=viser.Icon.PLAYER_PAUSE_FILLED
         )
         self.pause_train.on_click(lambda _: self.toggle_pause_button())
-        self.pause_train.on_click(lambda han: self._toggle_training_state(han))
-        self.resume_train = self.viser_server.gui.add_button(
-            label="Resume Training", disabled=False, icon=viser.Icon.PLAYER_PLAY_FILLED
-        )
-        self.resume_train.on_click(lambda _: self.toggle_pause_button())
-        self.resume_train.on_click(lambda han: self._toggle_training_state(han))
-        if self.train_btn_state == "training":
-            self.resume_train.visible = False
-        else:
-            self.pause_train.visible = False
 
-        # Add buttons to toggle training image visibility
-        self.hide_images = self.viser_server.gui.add_button(
-            label="Hide Train Cams", disabled=False, icon=viser.Icon.EYE_OFF, color=None
+        # Botão de resetar a câmera para o centro
+        self.reset_view = self.viser_server.gui.add_button(
+            label="Reset View", disabled=False, icon=viser.Icon.CAMERA
         )
-        self.hide_images.on_click(lambda _: self.set_camera_visibility(False))
-        self.hide_images.on_click(lambda _: self.toggle_cameravis_button())
-        self.show_images = self.viser_server.gui.add_button(
-            label="Show Train Cams", disabled=False, icon=viser.Icon.EYE, color=None
-        )
-        self.show_images.on_click(lambda _: self.set_camera_visibility(True))
-        self.show_images.on_click(lambda _: self.toggle_cameravis_button())
-        self.show_images.visible = False
+        # ---------------------------------------
+
         mkdown = self.make_stats_markdown(0, "0x0px")
         self.stats_markdown = self.viser_server.gui.add_markdown(mkdown)
         tabs = self.viser_server.gui.add_tab_group()
@@ -313,11 +298,65 @@ class Viewer:
         """
         self.stats_markdown.content = self.make_stats_markdown(step, None)
 
+    # -----------------------------------------------------------------
+    def get_original_camera_position(self):
+        """Obtpem as posições das câmeras originais"""
+        positions = []
+        for idx in self.camera_handles:
+            positions.append(self.camera_handles[idx].position)
+        return np.array(positions)
+
+    def calculate_camera_limits(self):
+        """Calcula os limites mínimos e máximos das posições das câmeras originais"""
+        positions = self.get_original_camera_position()
+        min_pos = positions.min(axis=0)
+        max_pos = positions.max(axis=0)
+        return min_pos, max_pos
+
+    def limit_camera_position(self, position, min_pos, max_pos):
+        """Limita a posição da câmera entre os valores mínimos e máximos"""
+        limited_position = np.clip(position, min_pos, max_pos)
+        was_limited = not np.allclose(position, limited_position)
+        if was_limited:
+            print(f"limit_camera_position: Posição da câmera limitada de {position} para {limited_position}")
+        return limited_position, was_limited
+
+    def render_callback(self, client_id: int) -> None:
+        """Callback para acionar a renderização."""
+        if client_id in self.render_statemachines:
+            clients = self.viser_server.get_clients()
+            client = clients.get(client_id)
+            if client:
+                camera_state = self.get_camera_state(client)
+                # print("render_callback: Acionando renderização para client_id:", client_id)
+                self.render_statemachines[client_id].action(RenderAction("move", camera_state))
+                # print("render_callback: Renderização acionada para client_id:", client_id)
+
+    def camera_update_callback(self, camera: viser.CameraHandle, min_pos, max_pos, client_id) -> None:
+        """Atualiza a posição da câmera"""
+        new_position, was_limited = self.limit_camera_position(camera.position, min_pos, max_pos)
+        # Apenas atualiza se houver uma mudança real na posição
+        if not np.allclose(camera.position, new_position):
+            camera.position = new_position
+            # Renderiza apenas se a posição da câmera foi limitada
+            if was_limited:
+                # print(f"camera_update_callback: Posição da câmera foi limitada para client_id: {client_id}")
+                self.render_callback(client_id)
+
+    # -----------------------------------------------------------------
+
     def get_camera_state(self, client: viser.ClientHandle) -> CameraState:
         R = vtf.SO3(wxyz=client.camera.wxyz)
         R = R @ vtf.SO3.from_x_radians(np.pi)
         R = torch.tensor(R.as_matrix())
         pos = torch.tensor(client.camera.position, dtype=torch.float64) / VISER_NERFSTUDIO_SCALE_RATIO
+
+        # Calcular os limites das posições das câmeras originais
+        min_pos, max_pos = self.calculate_camera_limits()
+        pos, _ = self.limit_camera_position(pos, min_pos, max_pos)
+
+        pos = pos.clone().detach().requires_grad_(False)
+
         c2w = torch.concatenate([R, pos[:, None]], dim=1)
         if self.ready and self.render_tab_state.preview_render:
             camera_type = self.render_tab_state.preview_camera_type
@@ -353,12 +392,26 @@ class Viewer:
         self.render_statemachines[client.client_id] = RenderStateMachine(self, VISER_NERFSTUDIO_SCALE_RATIO, client)
         self.render_statemachines[client.client_id].start()
 
+        # Evita renderização excessiva
+        previous_position = np.array(client.camera.position)
+        new_position = np.array(self.get_camera_state(client).c2w[:3, 3])
+
+        self.reset_view.on_click(lambda _: self.camera_update_callback(client.camera, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], client.client_id))
+
+        # Se a posição da câmera não mudou, não renderize
+        if np.allclose(previous_position, new_position):
+            return
+
         @client.camera.on_update
         def _(_: viser.CameraHandle) -> None:
             if not self.ready:
                 return
             self.last_move_time = time.time()
             with self.viser_server.atomic():
+                # Limitar e atualizar posição da câmera
+                min_pos, max_pos = self.calculate_camera_limits()
+                self.camera_update_callback(client.camera, min_pos, max_pos, client.client_id)
+
                 camera_state = self.get_camera_state(client)
                 self.render_statemachines[client.client_id].action(RenderAction("move", camera_state))
 
