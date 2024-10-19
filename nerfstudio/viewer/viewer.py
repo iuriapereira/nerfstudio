@@ -174,7 +174,7 @@ class Viewer:
 
         # Botão de resetar a câmera para o centro
         self.reset_view = self.viser_server.gui.add_button(
-            label="Reset View", disabled=False, icon=viser.Icon.CAMERA
+            label="Reset View", disabled=False, icon=viser.Icon.HOME_MOVE
         )
         # ---------------------------------------
 
